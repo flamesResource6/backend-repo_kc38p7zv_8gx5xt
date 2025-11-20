@@ -1,6 +1,8 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, EmailStr
+from typing import Optional
 
 app = FastAPI()
 
@@ -12,13 +14,61 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class EnergyInput(BaseModel):
+    tilt: float = Field(25, ge=0, le=90, description="Panel tilt in degrees")
+    azimuth: float = Field(180, ge=0, le=360, description="0=N,90=E,180=S,270=W")
+    irradiance: float = Field(4.8, ge=0, description="kWh/m^2/day baseline")
+    area: float = Field(18, ge=0, description="Array area in m^2")
+
+
+class EnergyOutput(BaseModel):
+    daily: float
+    monthly: float
+    score: int
+
+
+def compute_energy(inp: EnergyInput) -> EnergyOutput:
+    # Mirror the lightweight pseudo-model used in the frontend
+    tiltFactor = 1 - abs(inp.tilt - 30) / 120  # peak near 30deg
+    facingSouthFactor = 1 - min(abs(inp.azimuth - 180), 180) / 240  # peak at south
+    k = max(0.5, tiltFactor * 0.9 + facingSouthFactor * 0.6)
+    dailyKWh = inp.irradiance * inp.area * 0.18 * k  # ~18% efficiency
+    monthlyKWh = dailyKWh * 30
+    score = round(min(100, (k / 1.5) * 100))
+    return EnergyOutput(daily=max(0, dailyKWh), monthly=max(0, monthlyKWh), score=score)
+
+
+class SubscribeInput(BaseModel):
+    email: EmailStr
+
+
 @app.get("/")
 def read_root():
     return {"message": "Hello from FastAPI Backend!"}
 
+
 @app.get("/api/hello")
 def hello():
     return {"message": "Hello from the backend API!"}
+
+
+@app.post("/api/energy/estimate", response_model=EnergyOutput)
+def energy_estimate(payload: EnergyInput):
+    return compute_energy(payload)
+
+
+@app.post("/api/subscribe")
+def subscribe(payload: SubscribeInput):
+    # Try to persist to database if configured, otherwise accept anyway
+    try:
+        from database import create_document
+        doc_id = create_document("subscriber", {"email": payload.email})
+        return {"status": "ok", "stored": True, "id": doc_id}
+    except Exception:
+        # Graceful fallback if DB isn't configured
+        return {"status": "ok", "stored": False}
+
 
 @app.get("/test")
 def test_database():
